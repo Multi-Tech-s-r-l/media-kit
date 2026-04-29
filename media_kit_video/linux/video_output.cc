@@ -41,6 +41,31 @@ struct _VideoOutput {
 
 G_DEFINE_TYPE(VideoOutput, video_output, G_TYPE_OBJECT)
 
+// ── Workaround: block EGL_ANDROID_native_fence_sync ──────────────────────
+// On Mesa 23+ (Debian 13 / trixie) the EGL_ANDROID_native_fence_sync
+// extension is available.  mpv's OpenGL render API uses it to create native
+// fence file descriptors for frame synchronization via
+// eglDupNativeFenceFDANDROID().  Due to a bug in mpv (see
+// https://github.com/mpv-player/mpv/pull/17303 and
+// https://github.com/media-kit/media-kit/issues/1391) these fds are never
+// closed, leaking one fd per rendered frame and quickly exhausting the
+// process fd table.
+//
+// By returning NULL for the native-fence-related functions, mpv detects
+// that the extension is not (fully) available and falls back to
+// glFinish()-based synchronization which does not use file descriptors.
+// On Mesa versions that don't expose the extension nothing changes.
+static void* get_proc_address_no_native_fence(void* ctx, const char* name) {
+  if (g_strcmp0(name, "eglDupNativeFenceFDANDROID") == 0 ||
+      g_strcmp0(name, "eglCreateSyncKHR") == 0 ||
+      g_strcmp0(name, "eglClientWaitSyncKHR") == 0 ||
+      g_strcmp0(name, "eglDestroySyncKHR") == 0 ||
+      g_strcmp0(name, "eglWaitSyncKHR") == 0) {
+    return NULL;
+  }
+  return (void*)eglGetProcAddress(name);
+}
+
 static void video_output_dispose(GObject* object) {
   VideoOutput* self = VIDEO_OUTPUT(object);
   self->destroyed = TRUE;
@@ -168,10 +193,12 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
         // mpv will render into whatever context is current at the time of
         // mpv_render_context_render (which will be Flutter's context in
         // texture_gl_populate_texture).
+        //
+        // We use get_proc_address_no_native_fence instead of raw
+        // eglGetProcAddress to block EGL_ANDROID_native_fence_sync which
+        // causes fd leaks on Mesa 23+ (see comment above).
         mpv_opengl_init_params gl_init_params{
-            [](auto, auto name) {
-              return (void*)eglGetProcAddress(name);
-            },
+            get_proc_address_no_native_fence,
             NULL,
         };
 
