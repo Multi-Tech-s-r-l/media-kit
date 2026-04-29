@@ -5,6 +5,10 @@
 // All rights reserved.
 // Use of this source code is governed by MIT license that can be found in the
 // LICENSE file.
+//
+// Modified: eliminated isolated EGL context and EGLImage cross-context sharing.
+// mpv now renders directly in Flutter's GL context, fixing DMA-BUF file
+// descriptor leaks on Mesa 23+ (Debian 13 / trixie).
 
 #include "include/media_kit_video/video_output.h"
 #include "include/media_kit_video/texture_gl.h"
@@ -18,9 +22,9 @@
 struct _VideoOutput {
   GObject parent_instance;
   TextureGL* texture_gl;
-  EGLDisplay egl_display; /* EGL display for mpv rendering (shared with flutter). */
-  EGLContext egl_context; /* Isolated EGL context (non-shared). */
-  EGLSurface egl_surface; /* Place holder surface for activating egl context */
+  EGLDisplay egl_display; /* kept for API compat – stores Flutter's display */
+  EGLContext egl_context; /* unused (EGL_NO_CONTEXT) – kept for API compat */
+  EGLSurface egl_surface; /* unused (EGL_NO_SURFACE) – kept for API compat */
   guint8* pixel_buffer;
   TextureSW* texture_sw;
   GMutex mutex; /* Only used in S/W rendering. */
@@ -51,36 +55,11 @@ static void video_output_dispose(GObject* object) {
     fl_texture_registrar_unregister_texture(self->texture_registrar,
                                             FL_TEXTURE(self->texture_gl));
 
-    // Save Flutter's current context before cleanup
-    EGLDisplay current_display = eglGetCurrentDisplay();
-    EGLContext flutter_context = eglGetCurrentContext();
-    EGLSurface flutter_draw_surface = eglGetCurrentSurface(EGL_DRAW);
-    EGLSurface flutter_read_surface = eglGetCurrentSurface(EGL_READ);
-
-    // Free mpv_render_context with our own isolated EGL context
+    // Free mpv_render_context (Flutter's GL context should be current here
+    // since dispose runs on the main/platform thread on Linux GTK).
     if (self->render_context != NULL) {
-      if (self->egl_context != EGL_NO_CONTEXT) {
-        // Use PBuffer surface if available; fall back to surfaceless
-        EGLSurface surf = (self->egl_surface != EGL_NO_SURFACE) ? self->egl_surface : EGL_NO_SURFACE;
-        eglMakeCurrent(self->egl_display, surf, surf, self->egl_context);
-      }
       mpv_render_context_free(self->render_context);
       self->render_context = NULL;
-
-      // Restore Flutter's context
-      if (flutter_context != EGL_NO_CONTEXT) {
-        eglMakeCurrent(current_display, flutter_draw_surface, flutter_read_surface, flutter_context);
-      }
-    }
-
-    // Clean up EGL resources
-    if (self->egl_surface != EGL_NO_SURFACE) {
-      eglDestroySurface(self->egl_display, self->egl_surface);
-      self->egl_surface = EGL_NO_SURFACE;
-    }
-    if (self->egl_context != EGL_NO_CONTEXT) {
-      eglDestroyContext(self->egl_display, self->egl_context);
-      self->egl_context = EGL_NO_CONTEXT;
     }
 
     g_object_unref(self->texture_gl);
@@ -146,16 +125,9 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
   // mpv_set_option_string(self->handle, "video-timing-offset", "0");
 
   // ── FIX: DMA-BUF fd leak on Mesa 23+ (Debian 13 / trixie) ─────────────
-  // When using the libmpv render API (vo=libmpv) with hwdec=auto, VA-API
-  // exports each decoded frame as a DMA-BUF fd.  On Mesa 23+ these fds are
-  // never closed, leaking one fd per rendered frame and quickly exhausting
-  // the process fd table ("export failed").
-  //
-  // Workaround: force hwdec to its "-copy" variant so that VA-API still
-  // decodes on hardware but copies the result to normal system memory
-  // before the render step — no DMA-BUF sharing, no fd leak.
-  // Also disable vd-lavc-dr (direct rendering in the decoder) which on
-  // newer Mesa can create additional DMA-BUF references.
+  // Belt-and-suspenders: force hwdec to its "-copy" variant AND disable
+  // direct rendering.  These are no longer the primary fix (the main fix
+  // is rendering in Flutter's context, no EGLImage), but they add safety.
   {
     char* current_hwdec = mpv_get_property_string(self->handle, "hwdec");
     if (current_hwdec != NULL) {
@@ -169,141 +141,76 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
         changed = TRUE;
       }
       if (changed) {
-        g_print("media_kit: VideoOutput: hwdec=%s → *-copy (DMA-BUF fd leak workaround)\n",
+        g_print("media_kit: VideoOutput: hwdec=%s -> *-copy (DMA-BUF fd leak workaround)\n",
                 current_hwdec);
       }
       mpv_free(current_hwdec);
     }
-    // Disable direct rendering — prevents the decoder from writing
-    // directly into VA surfaces that keep DMA-BUF fds alive.
     mpv_set_property_string(self->handle, "vd-lavc-dr", "no");
   }
 
   gboolean hardware_acceleration_supported = FALSE;
   if (self->configuration.enable_hardware_acceleration) {
-    // Get Flutter's current EGL display (DO NOT share context)
+    // We render directly in Flutter's GL context — no separate EGL context,
+    // no EGLImage, no cross-context DMA-BUF sync fd leaks.
     EGLDisplay flutter_display = eglGetCurrentDisplay();
     EGLContext flutter_context = eglGetCurrentContext();
-    EGLSurface flutter_draw_surface = eglGetCurrentSurface(EGL_DRAW);
-    EGLSurface flutter_read_surface = eglGetCurrentSurface(EGL_READ);
 
     if (flutter_display != EGL_NO_DISPLAY && flutter_context != EGL_NO_CONTEXT) {
       self->egl_display = flutter_display;
 
-      // Bind OpenGL ES API (Flutter uses OpenGL ES on Linux)
-      eglBindAPI(EGL_OPENGL_ES_API);
+      // Create texture directly in Flutter's GL context
+      self->texture_gl = texture_gl_new(self);
 
-      // Query Flutter's EGL config and reuse it for compatibility
-      EGLConfig config = NULL;
-      EGLint config_id = 0;
-
-      if (eglQueryContext(self->egl_display, flutter_context, EGL_CONFIG_ID, &config_id)) {
-        g_print("media_kit: VideoOutput: Flutter's EGL config ID: %d\n", config_id);
-
-        // Get Flutter's exact config
-        EGLint num_configs = 0;
-        EGLint config_attribs[] = { EGL_CONFIG_ID, config_id, EGL_NONE };
-
-        if (eglChooseConfig(self->egl_display, config_attribs, &config, 1, &num_configs) && num_configs > 0) {
-          g_print("media_kit: VideoOutput: Using Flutter's EGL config.\n");
-        } else {
-          g_printerr("media_kit: VideoOutput: Failed to get Flutter's EGL config by ID.\n");
-          config = NULL;
-        }
-      } else {
-        g_printerr("media_kit: VideoOutput: Failed to query Flutter's EGL config ID.\n");
-      }
-
-      if (config != NULL) {
-        // Create an isolated EGL context (NOT shared with Flutter)
-        // This prevents OpenGL state pollution and resource contention
-        EGLint context_attribs[] = {
-            EGL_CONTEXT_CLIENT_VERSION, 2,
-            EGL_NONE,
+      if (fl_texture_registrar_register_texture(
+              texture_registrar, FL_TEXTURE(self->texture_gl))) {
+        // Create mpv render context using Flutter's current GL context.
+        // mpv will render into whatever context is current at the time of
+        // mpv_render_context_render (which will be Flutter's context in
+        // texture_gl_populate_texture).
+        mpv_opengl_init_params gl_init_params{
+            [](auto, auto name) {
+              return (void*)eglGetProcAddress(name);
+            },
+            NULL,
         };
 
-        self->egl_context = eglCreateContext(self->egl_display, config,
-                                             EGL_NO_CONTEXT, context_attribs);
+        mpv_render_param params[] = {
+            {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
+            {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, (void*)&gl_init_params},
+            {MPV_RENDER_PARAM_INVALID, (void*)0},
+            {MPV_RENDER_PARAM_INVALID, (void*)0},
+        };
 
-        if (self->egl_context != EGL_NO_CONTEXT) {
-          // FIX (Debian 13 / Mesa 23+ fd leak – secondary): create a 1×1
-          // PBuffer surface for the isolated context.  On newer Mesa (23+) a
-          // surfaceless context changes how DRM/DMA-BUF frame buffers are
-          // life-cycled when hardware-decoded frames are used; the PBuffer
-          // restores the expected behaviour.  We fall back to EGL_NO_SURFACE
-          // if the PBuffer cannot be created (e.g. EGL_BAD_MATCH on some
-          // platforms), so backward compatibility is preserved.
-          EGLint pbuffer_attribs[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
-          self->egl_surface = eglCreatePbufferSurface(self->egl_display, config, pbuffer_attribs);
-          if (self->egl_surface == EGL_NO_SURFACE) {
-            g_printerr("media_kit: VideoOutput: Warning: failed to create PBuffer surface (using surfaceless fallback). Error: 0x%x\n", eglGetError());
-          } else {
-            g_print("media_kit: VideoOutput: Using 1x1 PBuffer surface for isolated EGL context.\n");
-          }
+        // VAAPI acceleration requires passing X11/Wayland display
+        GdkDisplay* display = gdk_display_get_default();
+        if (GDK_IS_WAYLAND_DISPLAY(display)) {
+          params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
+          params[2].data = gdk_wayland_display_get_wl_display(display);
+        } else if (GDK_IS_X11_DISPLAY(display)) {
+          params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
+          params[2].data = gdk_x11_display_get_xdisplay(display);
+        }
 
-          EGLSurface mpv_surface = self->egl_surface;  // EGL_NO_SURFACE if PBuffer unavailable
-          if (eglMakeCurrent(self->egl_display, mpv_surface, mpv_surface, self->egl_context)) {
-            // Create texture with our isolated context
-            self->texture_gl = texture_gl_new(self);
-
-            if (fl_texture_registrar_register_texture(
-                    texture_registrar, FL_TEXTURE(self->texture_gl))) {
-              // Initialize mpv with our isolated EGL context
-              mpv_opengl_init_params gl_init_params{
-                  [](auto, auto name) {
-                    return (void*)eglGetProcAddress(name);
-                  },
-                  NULL,
-              };
-
-              mpv_render_param params[] = {
-                  {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
-                  {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, (void*)&gl_init_params},
-                  {MPV_RENDER_PARAM_INVALID, (void*)0},
-                  {MPV_RENDER_PARAM_INVALID, (void*)0},
-              };
-
-              // VAAPI acceleration requires passing X11/Wayland display
-              GdkDisplay* display = gdk_display_get_default();
-              if (GDK_IS_WAYLAND_DISPLAY(display)) {
-                params[2].type = MPV_RENDER_PARAM_WL_DISPLAY;
-                params[2].data = gdk_wayland_display_get_wl_display(display);
-              } else if (GDK_IS_X11_DISPLAY(display)) {
-                params[2].type = MPV_RENDER_PARAM_X11_DISPLAY;
-                params[2].data = gdk_x11_display_get_xdisplay(display);
-              }
-
-              if (mpv_render_context_create(&self->render_context, self->handle, params) == 0) {
-                mpv_render_context_set_update_callback(
-                    self->render_context,
-                    [](void* data) {
-                      VideoOutput* self = (VideoOutput*)data;
-                      if (self->destroyed) {
-                        return;
-                      }
-                      fl_texture_registrar_mark_texture_frame_available(
-                          self->texture_registrar, FL_TEXTURE(self->texture_gl));
-                    },
-                    self);
-                hardware_acceleration_supported = TRUE;
-                g_print("media_kit: VideoOutput: H/W rendering with isolated EGL context.\n");
-              } else {
-                g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context.\n");
-              }
-            } else {
-              g_printerr("media_kit: VideoOutput: Failed to register texture.\n");
-            }
-
-            // Restore Flutter's context
-            eglMakeCurrent(flutter_display, flutter_draw_surface, flutter_read_surface, flutter_context);
-          } else {
-            g_printerr("media_kit: VideoOutput: Failed to make isolated EGL context current. Error: 0x%x\n", eglGetError());
-          }
+        if (mpv_render_context_create(&self->render_context, self->handle, params) == 0) {
+          mpv_render_context_set_update_callback(
+              self->render_context,
+              [](void* data) {
+                VideoOutput* self = (VideoOutput*)data;
+                if (self->destroyed) {
+                  return;
+                }
+                fl_texture_registrar_mark_texture_frame_available(
+                    self->texture_registrar, FL_TEXTURE(self->texture_gl));
+              },
+              self);
+          hardware_acceleration_supported = TRUE;
+          g_print("media_kit: VideoOutput: H/W rendering in Flutter's GL context (no isolated EGL context).\n");
         } else {
-          g_printerr("media_kit: VideoOutput: Failed to create isolated EGL context. Error: 0x%x\n", eglGetError());
+          g_printerr("media_kit: VideoOutput: Failed to create mpv_render_context.\n");
         }
       } else {
-        g_printerr("media_kit: VideoOutput: Could not obtain Flutter's EGL config.\n");
+        g_printerr("media_kit: VideoOutput: Failed to register texture.\n");
       }
     } else {
       g_printerr("media_kit: VideoOutput: EGL display or context is invalid.\n");
@@ -387,11 +294,6 @@ void video_output_set_texture_update_callback(
 }
 
 void video_output_set_size(VideoOutput* self, gint64 width, gint64 height) {
-  // Ideally, a mutex should be used here & |video_output_get_width| +
-  // |video_output_get_height|. However, that is throwing everything into a
-  // deadlock. Flutter itself seems to have some synchronization mechanism in
-  // rendering & platform channels AFAIK.
-
   // H/W
   if (self->texture_gl) {
     self->width = width;
@@ -461,8 +363,6 @@ gint64 video_output_get_width(VideoOutput* self) {
   height = rotate == 0 || rotate == 180 ? dh : dw;
 
   if (self->texture_sw != NULL) {
-    // Make sure |width| & |height| fit between |SW_RENDERING_MAX_WIDTH| &
-    // |SW_RENDERING_MAX_HEIGHT| while maintaining aspect ratio.
     if (width >= SW_RENDERING_MAX_WIDTH) {
       return SW_RENDERING_MAX_WIDTH;
     }
@@ -511,8 +411,6 @@ gint64 video_output_get_height(VideoOutput* self) {
   height = rotate == 0 || rotate == 180 ? dh : dw;
 
   if (self->texture_sw != NULL) {
-    // Make sure |width| & |height| fit between |SW_RENDERING_MAX_WIDTH| &
-    // |SW_RENDERING_MAX_HEIGHT| while maintaining aspect ratio.
     if (height >= SW_RENDERING_MAX_HEIGHT) {
       return SW_RENDERING_MAX_HEIGHT;
     }
