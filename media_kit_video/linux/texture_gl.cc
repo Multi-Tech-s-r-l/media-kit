@@ -193,8 +193,8 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       glBindTexture(GL_TEXTURE_2D, 0);
 
-      // Flush to ensure mpv's texture is ready
-      glFlush();
+      // Finish to ensure mpv's texture is fully ready and GPU resources released
+      glFinish();
 
       // Switch back to Flutter's context to create/update Flutter's texture
       eglMakeCurrent(flutter_display, flutter_draw, flutter_read, flutter_context);
@@ -260,8 +260,8 @@ gboolean texture_gl_populate_texture(FlTextureGL* texture,
     // Unbind FBO
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // Flush to ensure rendering is complete
-    glFlush();
+    // Finish to ensure rendering is complete and GPU releases DMA-BUF refs
+    glFinish();
 
     // Restore Flutter's context
     eglMakeCurrent(flutter_display, flutter_draw, flutter_read, flutter_context);

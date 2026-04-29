@@ -144,6 +144,41 @@ VideoOutput* video_output_new(FlTextureRegistrar* texture_registrar,
   mpv_set_option_string(self->handle, "video-sync", "audio");
   // Causes frame drops with `pulse` audio output. (SlotSun/dart_simple_live#42)
   // mpv_set_option_string(self->handle, "video-timing-offset", "0");
+
+  // ── FIX: DMA-BUF fd leak on Mesa 23+ (Debian 13 / trixie) ─────────────
+  // When using the libmpv render API (vo=libmpv) with hwdec=auto, VA-API
+  // exports each decoded frame as a DMA-BUF fd.  On Mesa 23+ these fds are
+  // never closed, leaking one fd per rendered frame and quickly exhausting
+  // the process fd table ("export failed").
+  //
+  // Workaround: force hwdec to its "-copy" variant so that VA-API still
+  // decodes on hardware but copies the result to normal system memory
+  // before the render step — no DMA-BUF sharing, no fd leak.
+  // Also disable vd-lavc-dr (direct rendering in the decoder) which on
+  // newer Mesa can create additional DMA-BUF references.
+  {
+    char* current_hwdec = mpv_get_property_string(self->handle, "hwdec");
+    if (current_hwdec != NULL) {
+      gboolean changed = FALSE;
+      if (g_strcmp0(current_hwdec, "auto") == 0 ||
+          g_strcmp0(current_hwdec, "yes") == 0) {
+        mpv_set_property_string(self->handle, "hwdec", "auto-copy");
+        changed = TRUE;
+      } else if (g_strcmp0(current_hwdec, "vaapi") == 0) {
+        mpv_set_property_string(self->handle, "hwdec", "vaapi-copy");
+        changed = TRUE;
+      }
+      if (changed) {
+        g_print("media_kit: VideoOutput: hwdec=%s → *-copy (DMA-BUF fd leak workaround)\n",
+                current_hwdec);
+      }
+      mpv_free(current_hwdec);
+    }
+    // Disable direct rendering — prevents the decoder from writing
+    // directly into VA surfaces that keep DMA-BUF fds alive.
+    mpv_set_property_string(self->handle, "vd-lavc-dr", "no");
+  }
+
   gboolean hardware_acceleration_supported = FALSE;
   if (self->configuration.enable_hardware_acceleration) {
     // Get Flutter's current EGL display (DO NOT share context)
